@@ -96,6 +96,37 @@ About 19 B/s at 75 bpm, versus 720 B/s for raw 16-bit streaming at 360 Hz — a
 
 Both modes emit `#`-prefixed comment lines for banners and statistics.
 
+## Output link
+
+Independently of the output mode, the byte stream can be sent over USB, over a
+Bluetooth module, or over both. The link is set by `OUTPUT_LINK` in `config.h`
+and can be changed at run time with the `L` command.
+
+| `OUTPUT_LINK` | Destination |
+|---|---|
+| `0` (`LINK_USB`) | USB — `Serial` |
+| `1` (`LINK_BT`) | Bluetooth — `Serial1` |
+| `2` (`LINK_BOTH`) | both, simultaneously |
+
+Bluetooth support is compiled in only when `USE_BLUETOOTH` is `1`; it costs
+about 160 bytes of SRAM for the `Serial1` ring buffers, so USB-only builds
+should leave it at `0`. Selecting a Bluetooth link without it is a compile
+error rather than a silent fallback.
+
+Wiring on the Mega 2560: the module's `RXD` goes to `TX1` (pin 18) and its
+`TXD` to `RX1` (pin 19). A 5 V `TX1` output must be divided down before
+reaching the `RXD` input of a 3.3 V module. `BT_BAUD_RATE` must match the rate
+the module is configured for — 115200 here, not the 9600 that HC-05 modules
+ship with.
+
+When `LINK_BOTH` is selected, a sample line is emitted only if **both** links
+have room for it, so the slower link governs the drop rate. This is deliberate:
+the two streams stay identical, which is what makes a side-by-side comparison
+meaningful.
+
+Commands are accepted from whichever link sends them, so the node remains
+controllable over Bluetooth once the USB cable is disconnected.
+
 ## Serial commands
 
 | Command | Effect |
@@ -103,13 +134,14 @@ Both modes emit `#`-prefixed comment lines for banners and statistics.
 | `T<n>` | set the squared-derivative threshold |
 | `I<n>` | set the number of smoothing passes (1…`SMOOTH_MAX_ITERATIONS`); resets the pipeline |
 | `M<0\|1>` | select output mode (0 = full, 1 = metadata) |
+| `L<0\|1\|2>` | select output link (0 = USB, 1 = Bluetooth, 2 = both) |
 | `S` | print statistics |
 | `X` | reset the pipeline and all counters |
 
 Statistics line:
 
 ```
-# n=<samples> peaks=<count> overruns=<count> dropped=<count> mode=<m> thr=<t> iter=<k>
+# n=<samples> peaks=<count> overruns=<count> dropped=<count> mode=<m> link=<l> thr=<t> iter=<k>
 ```
 
 `overruns` counts sampling instants missed because output or command handling
@@ -126,6 +158,9 @@ overran the sampling period — it should stay at 0 in `MODE_METADATA`.
 | `QRS_WIDTH` | `30` | Width of the retrospective window searched backwards for the R apex (≈83 ms at 360 Hz). Not a minimum peak separation — that role belongs to `REFRACTORY_MS`. |
 | `REFRACTORY_MS` | `200` | Blanking period after an accepted R-peak. |
 | `OUTPUT_MODE` | `0` | `0` = full, `1` = metadata only. |
+| `OUTPUT_LINK` | `0` | `0` = USB, `1` = Bluetooth, `2` = both. |
+| `USE_BLUETOOTH` | `0` | Compile `Serial1` support in; costs ~160 bytes of SRAM. |
+| `BT_BAUD_RATE` | `115200` | Bluetooth module rate; must match its configuration. |
 | `BAUD_RATE` | `115200` | 250000 recommended for `MODE_FULL`. |
 | `ECG_PIN` | `A0` | Analog input wired to the AD8232 `OUTPUT` pin. |
 | `USE_LEAD_OFF` | `0` | Set to 1 if `LO+`/`LO-` are wired. |

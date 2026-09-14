@@ -19,6 +19,11 @@
 static int32_t g_threshold  = THRESHOLD;
 static uint8_t g_iterations = SMOOTH_ITERATIONS;
 static uint8_t g_outputMode = OUTPUT_MODE;
+static uint8_t g_link       = OUTPUT_LINK;
+
+#if USE_BLUETOOTH
+#define BT_PORT Serial1
+#endif
 
 // One 3-tap smoothing stage: y[n] = (x[n-1] + 6*x[n] + x[n+1] + 4) >> 3
 // Emitting y[n] requires x[n+1], so every stage delays the stream by one sample.
@@ -56,19 +61,56 @@ static uint32_t g_droppedLines;      // sample lines dropped, TX buffer full
 static uint32_t g_peakCount;
 
 // ----------------------------------------------------------------- output
-// Sample lines are droppable: acquisition must never stall on the UART.
+// The pipeline is link-agnostic: the same byte stream goes to USB, to the
+// Bluetooth module, or to both, depending on g_link.
+static inline bool linkUsb() { return g_link == LINK_USB || g_link == LINK_BOTH; }
+static inline bool linkBt()  { return g_link == LINK_BT  || g_link == LINK_BOTH; }
+
+// Free space on the narrowest selected link.
+static int txSpace()
+{
+    int space = 32767;
+    if (linkUsb()) {
+        int s = Serial.availableForWrite();
+        if (s < space) space = s;
+    }
+#if USE_BLUETOOTH
+    if (linkBt()) {
+        int s = BT_PORT.availableForWrite();
+        if (s < space) space = s;
+    }
+#endif
+    return space;
+}
+
+static void txWrite(const char* s, int len)
+{
+    if (linkUsb()) Serial.write((const uint8_t*)s, (size_t)len);
+#if USE_BLUETOOTH
+    if (linkBt())  BT_PORT.write((const uint8_t*)s, (size_t)len);
+#endif
+}
+
+// Sample lines are droppable: acquisition must never stall on a UART.
 static void txSample(const char* s, int len)
 {
     if (len <= 0) return;
-    if (Serial.availableForWrite() < len) { g_droppedLines++; return; }
-    Serial.write((const uint8_t*)s, (size_t)len);
+    if (txSpace() < len) { g_droppedLines++; return; }
+    txWrite(s, len);
 }
 
 // Peak lines are never dropped (a few dozen bytes per beat).
 static void txPeak(const char* s, int len)
 {
-    if (len > 0) Serial.write((const uint8_t*)s, (size_t)len);
+    if (len > 0) txWrite(s, len);
 }
+
+#if USE_BLUETOOTH
+#define TX_BANNER(lit) do { if (linkUsb()) Serial.println(F(lit)); \
+                            if (linkBt())  BT_PORT.println(F(lit)); } while (0)
+#else
+#define TX_BANNER(lit) do { if (linkUsb()) Serial.println(F(lit)); } while (0)
+#endif
 
 static void emitSample(int16_t raw, int16_t smooth, int32_t der)
 {
@@ -91,10 +133,11 @@ static void emitStats()
 {
     char buf[96];
     int n = snprintf(buf, sizeof(buf),
-                     "# n=%lu peaks=%lu overruns=%lu dropped=%lu mode=%u thr=%ld iter=%u\n",
+                     "# n=%lu peaks=%lu overruns=%lu dropped=%lu mode=%u link=%u thr=%ld iter=%u\n",
                      (unsigned long)g_sampleIndex, (unsigned long)g_peakCount,
                      (unsigned long)g_overruns,    (unsigned long)g_droppedLines,
-                     (unsigned)g_outputMode, (long)g_threshold, (unsigned)g_iterations);
+                     (unsigned)g_outputMode, (unsigned)g_link, (long)g_threshold,
+                     (unsigned)g_iterations);
     txPeak(buf, n);
 }
 
@@ -223,19 +266,31 @@ static void resetPipeline()
 }
 
 // ----------------------------------------------------------------- commands
-// T<n> threshold | I<n> smoothing passes | M<0|1> output mode | S stats | X reset
+// Commands arrive on whichever link is talking.
+static Stream* cmdStream()
+{
+    if (Serial.available()) return &Serial;
+#if USE_BLUETOOTH
+    if (BT_PORT.available()) return &BT_PORT;
+#endif
+    return NULL;
+}
+
+// T<n> threshold | I<n> smoothing passes | M<0|1> output mode
+// L<0|1|2> output link | S stats | X reset
 static void handleSerial()
 {
-    if (!Serial.available()) return;
-    char cmd = Serial.read();
+    Stream* in = cmdStream();
+    if (in == NULL) return;
+    char cmd = (char)in->read();
     switch (cmd) {
         case 'T': {
-            long v = Serial.parseInt();
+            long v = in->parseInt();
             if (v > 0) { g_threshold = v; emitStats(); }
             break;
         }
         case 'I': {
-            long v = Serial.parseInt();
+            long v = in->parseInt();
             if (v >= 1 && v <= SMOOTH_MAX_ITERATIONS) {
                 g_iterations = (uint8_t)v;
                 resetPipeline();
@@ -244,9 +299,21 @@ static void handleSerial()
             break;
         }
         case 'M': {
-            long v = Serial.parseInt();
+            long v = in->parseInt();
             if (v == MODE_FULL || v == MODE_METADATA) {
                 g_outputMode = (uint8_t)v;
+                emitStats();
+            }
+            break;
+        }
+        case 'L': {
+            long v = in->parseInt();
+#if USE_BLUETOOTH
+            if (v == LINK_USB || v == LINK_BT || v == LINK_BOTH) {
+#else
+            if (v == LINK_USB) {
+#endif
+                g_link = (uint8_t)v;
                 emitStats();
             }
             break;
@@ -262,18 +329,25 @@ void setup()
 {
     Serial.begin(BAUD_RATE);
     while (!Serial && millis() < 3000) {}
+#if USE_BLUETOOTH
+    BT_PORT.begin(BT_BAUD_RATE);
+#endif
 #if USE_LEAD_OFF
     pinMode(LO_PLUS_PIN,  INPUT);
     pinMode(LO_MINUS_PIN, INPUT);
 #endif
     resetPipeline();
-    Serial.println(F("# ECG R-Peak Detector (AD8232), streaming"));
-    Serial.print(F("# fs_nominal_hz="));  Serial.println(1000000UL / SAMPLE_PERIOD_US);
-    Serial.print(F("# refractory_samples=")); Serial.println((unsigned long)REFRACTORY_SAMPLES);
-    Serial.print(F("# raw_buf_len="));    Serial.println((unsigned)RAW_BUF_LEN);
+    TX_BANNER("# ECG R-Peak Detector (AD8232), streaming");
+    {
+        char b[64];
+        int n = snprintf(b, sizeof(b), "# fs_nominal_hz=%lu refractory=%lu raw_buf=%u\n",
+                         (unsigned long)(1000000UL / SAMPLE_PERIOD_US),
+                         (unsigned long)REFRACTORY_SAMPLES, (unsigned)RAW_BUF_LEN);
+        txPeak(b, n);
+    }
     emitStats();
-    Serial.println(F("# MODE_FULL lines: raw,smoothed,derivative_squared"));
-    Serial.println(F("# peak lines: R,sample_index,amplitude,rr_ms"));
+    TX_BANNER("# MODE_FULL lines: raw,smoothed,derivative_squared");
+    TX_BANNER("# peak lines: R,sample_index,amplitude,rr_ms");
     g_nextSampleMicros = micros();
 }
 
